@@ -1,5 +1,6 @@
 #!/bin/bash -x
-mqtt_args="-h 192.168.0.1 -p 1883 -u test -P test -t /room/rgbstrip/rgb"
+mqtt_args="-h 192.168.0.1 -p 1883 -u test -P test"
+mqtt_topic="/rgbstrip/rgb"
 
 xdialog() {
 	Xdialog --title "RGB LED strip" --interval 100 --stdout "$@"
@@ -13,41 +14,87 @@ rgb_hex() {
 	printf "${1}${2}${3}\n"
 }
 
-hsv() {
-	h=$1
-	s=$2
-	v=$3
-	[[ $s == 0 ]] && {
+hsv2rgb() {
+	local h=${1}
+	local s=$[${2}*255/100]
+	local v=$[${3}*255/100]
+	[[ $s -eq 0 ]] && {
 		rgb $v $v $v
 		return
 	}
 
-	local i=$[h/43]
-	local rem=$[(h-(i*43))*6]
-	local p=$[(v*(255-s))>>8]
-	local q=$[(v*(255-((rem*s)>>8)))>>8]
-	local t=$[(v*(255-(((255-rem)*s)>>8)))>>8]
-	case $i in
+	local i=$[h/60]
+	local vmin=$[(255-s)*v/255]
+	local a=$[(v-vmin)*(h-(i*60))/60]
+	local vinc=$[vmin+a]
+	local vdec=$[v-a]
+	case ${i%.} in
 		0)
-			rgb $v $t $p
+			rgb $v $vinc $vmin
 			;;
 		1)
-			rgb $q $v $p
+			rgb $vdec $v $vmin
 			;;
 		2)
-			rgb $p $v $t
+			rgb $vmin $v $vinc
 			;;
 		3)
-			rgb $p $q $v
+			rgb $vmin $vdec $v
 			;;
 		4)
-			rgb $t $p $v
+			rgb $vinc $vmin $v
 			;;
 		*)
-			rgb $v $p $q
+			rgb $v $vmin $vdec
 			;;
 	esac
 }
+
+rgb2hsv() {
+	r=$1
+	g=$2
+	b=$3
+
+	max=$r
+	[[ $g -gt $max ]] && max=$g
+	[[ $b -gt $max ]] && max=$b
+	
+	min=$r
+	[[ $g -lt $min ]] && min=$g
+	[[ $b -lt $min ]] && min=$b
+	
+	if [[ $max -eq $min ]]; then
+		h=0
+	elif [[ $max -eq $r ]]; then
+		t=$[60*(g-b)/(max-min)]
+		h=$[(g>=b) ? t : (t+360)]
+	elif [[ $max -eq $g ]]; then
+		h=$[60*(b-r)/(max-min)+120]
+	elif [[ $max -eq $b ]]; then
+		h=$[60*(r-g)/(max-min)+240]
+	else
+		>&2 echo "wtf?"
+	fi
+
+	if [[ $max -eq '0' ]]; then
+		s=0
+	else
+		s=$[100-((min*100)/max)]
+	fi
+
+	echo $h $s $[max*100/255]
+}
+
+r=0
+g=0
+b=0
+old_rgb=`mosquitto_sub $mqtt_args -C 1 -t $mqtt_topic`
+re='(..)(..)(..)'
+if [[ $old_rgb =~ $re ]]; then
+	r=$[0x${BASH_REMATCH[1]}]
+	g=$[0x${BASH_REMATCH[2]}]
+	b=$[0x${BASH_REMATCH[3]}]
+fi
 
 case "$1" in
 	w|white)
@@ -64,14 +111,16 @@ case "$1" in
 		done
 		;;
 	h|hsvcolor)
+		hsv=`rgb2hsv $r $g $b`
+		read h s v <<<"$hsv"
 		re='([0-9]+)/([0-9]+)/([0-9]+)'
 		xdialog --3rangesbox "Color" 25 100 \
-			"Hue" 0 255 0 \
-			"Saturation" 0 255 0 \
-			"Value" 0 255 0 |
+			"Hue" 0 359 $h \
+			"Saturation" 0 100 $s \
+			"Value" 0 100 $v |
 		while read v; do
 			if [[ $v =~ $re ]]; then
-				hsv ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}
+				hsv2rgb ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}
 			fi
 		done
 		;;
@@ -96,15 +145,15 @@ case "$1" in
 			esac
 			old_mchan=${mchan}
 			old_mval=${mval}
-			hsv $h $s $v
+			hsv2rgb $h $s $v
 		done
 		;;
 	*)
 		re='([0-9]+)/([0-9]+)/([0-9]+)'
 		xdialog --3rangesbox "Color" 25 100 \
-			"Red" 0 255 0 \
-			"Green" 0 255 0 \
-			"Blue" 0 255 0 |
+			"Red" 0 255 $r \
+			"Green" 0 255 $g \
+			"Blue" 0 255 $b |
 		while read v; do
 			if [[ $v =~ $re ]]; then
 				rgb ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}
@@ -116,6 +165,6 @@ while read str; do
 	if [[ "$str" != "$old_str" ]]; then
 		echo $str
 		old_str=$str
-		mosquitto_pub $mqtt_args -m $str
+		mosquitto_pub $mqtt_args -r -t $mqtt_topic -m $str
 	fi
 done
